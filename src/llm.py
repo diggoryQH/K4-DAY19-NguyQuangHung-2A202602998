@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib
 import os
 import time
+import re
 from dataclasses import dataclass, fields
 from typing import Any
 
@@ -115,29 +116,41 @@ class MeteredLLM:
                               else _openai_client(self.embed_provider))
 
     def chat(self, prompt: str, json_mode: bool = False) -> str:
-        start = time.perf_counter()
-        if self.chat_provider == "anthropic":
-            text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
-        else:
-            if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    response_format={"type": "json_object"},
-                )
-            else:
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                )
-            text, model = response.choices[0].message.content or "", self.chat_model_id
-            usage = response.usage
-            tokens_in = usage.prompt_tokens if usage else 0
-            tokens_out = usage.completion_tokens if usage else 0
-        self.usage += Usage(1, tokens_in, tokens_out, price(model, tokens_in, tokens_out), time.perf_counter() - start)
-        return _strip_fences(text) if json_mode else text
+        for attempt in range(6):
+            try:
+                start = time.perf_counter()
+                if self.chat_provider == "anthropic":
+                    text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
+                else:
+                    if json_mode and self.chat_provider != "gemini":
+                        response = self._chat_client.chat.completions.create(
+                            model=self.chat_model_id,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0,
+                            response_format={"type": "json_object"},
+                        )
+                    else:
+                        response = self._chat_client.chat.completions.create(
+                            model=self.chat_model_id,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0,
+                        )
+                    text, model = response.choices[0].message.content or "", self.chat_model_id
+                    usage = response.usage
+                    tokens_in = usage.prompt_tokens if usage else 0
+                    tokens_out = usage.completion_tokens if usage else 0
+                self.usage += Usage(1, tokens_in, tokens_out, price(model, tokens_in, tokens_out), time.perf_counter() - start)
+                return _strip_fences(text) if json_mode else text
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "rate" in err_str.lower() or "quota" in err_str.lower() or "exhausted" in err_str.lower():
+                    match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_str) or re.search(r"retryDelay': '(\d+)s", err_str)
+                    delay = float(match.group(1)) + 2.0 if match else 20.0
+                    print(f"\n[RateLimit 429] Chờ {delay:.1f}s trước khi thử lại (lần {attempt + 1}/6)...")
+                    time.sleep(delay)
+                else:
+                    raise
+        raise RuntimeError("Vượt quá số lần thử lại do Rate Limit 429")
 
     def _chat_anthropic(self, prompt: str) -> tuple[str, str, int, int]:
         # Claude Opus 5.5: thinking is always on and sampling params are removed; effort is the cost lever.
@@ -157,10 +170,22 @@ class MeteredLLM:
         return text, response.model, response.usage.input_tokens, response.usage.output_tokens
 
     def embed(self, text: str) -> list[float]:
-        start = time.perf_counter()
-        response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
-        tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
-        self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
-        return [float(value) for value in response.data[0].embedding]
+        for attempt in range(6):
+            try:
+                start = time.perf_counter()
+                response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+                tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
+                self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
+                return [float(value) for value in response.data[0].embedding]
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "rate" in err_str.lower() or "quota" in err_str.lower() or "exhausted" in err_str.lower():
+                    match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_str) or re.search(r"retryDelay': '(\d+)s", err_str)
+                    delay = float(match.group(1)) + 2.0 if match else 20.0
+                    print(f"\n[RateLimit 429 Embed] Chờ {delay:.1f}s trước khi thử lại (lần {attempt + 1}/6)...")
+                    time.sleep(delay)
+                else:
+                    raise
+        raise RuntimeError("Vượt quá số lần thử lại do Rate Limit 429")
 
     __call__ = embed
